@@ -412,7 +412,13 @@ class Decoder:
 class Receiver:
     def __init__(self, args):
         self.args = args
-        self.sdr = None if args.from_raw else SoapySDR.Device("driver=hackrf")
+        if args.from_raw:
+            self.sdr = None
+        else:
+            devs = SoapySDR.Device.enumerate("driver=hackrf")
+            if not devs:
+                raise RuntimeError("ERROR: No HackRF device found")
+            self.sdr = SoapySDR.Device(devs[0])
         self.decoder = Decoder(lat_ref=args.lat, lon_ref=args.lon)
         self._chunks = 0
         self.t0 = time.monotonic()
