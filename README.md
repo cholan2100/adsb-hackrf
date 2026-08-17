@@ -109,3 +109,11 @@ python test_adsb.py
 HackRF One while receiving frames from this receiver:
 
 ![HackRF ADS-B receiver](hackrf.jpg)
+
+### Antenna
+
+1090 MHz ground plane antenna used with this setup:
+
+![1090 MHz ground plane antenna](antenna.jpg)
+
+3D-printed antenna mount: https://www.thingiverse.com/thing:4757813
