@@ -1,0 +1,4 @@
+This file demonstrates that git user configuration is working correctly.
+
+Author: g
+Email: g@nc
