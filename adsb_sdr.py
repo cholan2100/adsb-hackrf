@@ -806,7 +806,10 @@ def main():
 
     # RTL-SDR Gain, AGC & Tuner settings
     ap.add_argument("--gain", "-g", type=float, default=40, help="RTL-SDR / general tuner gain in dB (default: 40)")
-    ap.add_argument("--agc", action="store_true", help="enable RTL-SDR Dual AGC (Tuner AGC + RTL2832 Digital AGC)")
+    ap.add_argument("--agc", action="store_true", default=None,
+                    help="enable Dual AGC — Tuner AGC + RTL2832 Digital AGC (default for RTL-SDR)")
+    ap.add_argument("--no-agc", action="store_false", dest="agc",
+                    help="disable AGC, use manual --gain instead")
     ap.add_argument("--ppm", type=float, default=0, help="frequency correction in PPM (for RTL-SDR crystal offset)")
     ap.add_argument("--biastee", action="store_true", help="enable Bias-Tee (power active antenna/LNA)")
     ap.add_argument("--no-offset-tune", action="store_false", dest="offset_tune", default=True,
@@ -827,11 +830,31 @@ def main():
                     help="decode a saved raw IQ file (--save-raw output) instead of live SDR")
     args = ap.parse_args()
 
+    user_rate = args.rate  # None means user didn't specify
+
+    # Temporary default rate for Receiver init (refined after device detection)
     if args.rate is None:
-        args.rate = 2_400_000.0 if (args.device or "").lower() in ("rtlsdr", "rtl") else 2_000_000.0
+        args.rate = 2_000_000.0
 
     try:
         rec = Receiver(args)
+    except RuntimeError as e:
+        print(f"{e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Apply RTL-SDR-specific defaults after device detection
+    is_rtlsdr = "rtl" in rec.driver_name.lower()
+    if is_rtlsdr:
+        if user_rate is None:
+            args.rate = 2_400_000.0
+            rec.sps = rec._sps(int(args.rate))
+        if args.agc is None:
+            args.agc = True
+    else:
+        if args.agc is None:
+            args.agc = False
+
+    try:
         rec.start()
     except RuntimeError as e:
         print(f"{e}", file=sys.stderr)

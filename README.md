@@ -60,11 +60,11 @@ Decoded frames stream to stdout; one line per frame:
 # HackRF (default device)
 python adsb_sdr.py --freq 1090 --rate 2000000 --lna 40 --vga 40 --amp 0
 
-# RTL-SDR dongle with Dual AGC (Tuner AGC + RTL2832 Digital AGC) and DC Block:
-python adsb_sdr.py --device rtlsdr --agc
+# RTL-SDR dongle (2.4 MS/s, Dual AGC enabled by default):
+python adsb_sdr.py --device rtlsdr
 
-# RTL-SDR dongle with manual max gain (e.g. 49.6 dB):
-python adsb_sdr.py --device rtlsdr --gain 49.6 --ppm 0
+# RTL-SDR dongle with manual gain (disables default AGC):
+python adsb_sdr.py --device rtlsdr --no-agc --gain 49.6 --ppm 0
 
 # RTL-SDR with active antenna LNA via Bias-Tee:
 python adsb_sdr.py --device rtlsdr --agc --biastee
@@ -81,9 +81,9 @@ python adsb_sdr.py --save-raw captures        # record raw I/Q while live
 
 Defaults: 1090 MHz, 2 MS/s.
 - **HackRF**: LNA=40 dB, VGA=40 dB, AMP=0 dB. Do **not** enable the HackRF preamp (`--amp 1`), it saturates the ADC.
-- **RTL-SDR**:
-  - `--agc`: Enables both **Tuner AGC** and **RTL2832 Digital AGC** (recommended for variable signal conditions).
-  - `--gain <dB>`: Sets manual tuner gain (0 to 49.6 dB).
+- **RTL-SDR** (default: 2.4 MS/s, Dual AGC):
+  - **Dual AGC** (Tuner AGC + RTL2832 Digital AGC) is enabled by default. Use `--no-agc` to disable.
+  - `--gain <dB>`: Sets manual tuner gain (0 to 49.6 dB, requires `--no-agc`).
   - Software DC blocker (`--no-dc-block` to disable) and hardware offset tuning (`--no-offset-tune` to disable) are active by default to prevent zero-Hz carrier leakage.
   - `--biastee`: Powers active antenna preamplifiers via the RTL-SDR / HackRF coax.
 
