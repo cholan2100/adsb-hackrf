@@ -164,4 +164,42 @@ def replay_check(rate, sps):
 replay_check(8e6, 4)
 replay_check(2e6, 1)
 
+# --- test adsb_sdr ---
+import adsb_sdr as S
+check(S.crc_ok(hx("8D406B902015A678D4D220AA4BDA"), 112), "adsb_sdr: crc ok good long")
+check(S.df_of(hx("8D406B902015A678D4D220AA4BDA"), 112) == 17, "adsb_sdr: df17")
+
+def replay_check_sdr(rate, sps):
+    r1, m1 = make_raw("8D406B902015A678D4D220AA4BDA", sps=sps, seed=10)
+    r2, m2 = make_raw("8D40058B58C901375147EFD09357", sps=sps, seed=11)
+    lead = np.zeros(4096 * 8, dtype=np.int16)
+    gap = np.zeros(2000 * 8, dtype=np.int16)
+    trail = np.zeros(4096 * 8, dtype=np.int16)
+    raw_stream = np.concatenate([lead, r1, gap, r2, trail])
+    path = os.path.join(tempfile.gettempdir(), "replay_test_sdr.c16")
+    raw_stream.tofile(path)
+
+    class NS:
+        pass
+
+    ns = NS()
+    ns.device = "hackrf"
+    ns.device_args = ""
+    ns.from_raw = path
+    ns.lat = None
+    ns.lon = None
+    ns.rate = rate
+    rec = S.Receiver(ns)
+    rec.start()
+    data = np.fromfile(rec._rawsrc, dtype="<i2")
+    outs = rec.feed(data)
+    check(len(outs) == 2, "adsb_sdr: raw replay @%.0fMHz finds 2 frames" % (rate / 1e6))
+    check(sorted(o[0] for o in outs) == sorted(["%028X" % m1, "%028X" % m2]),
+          "adsb_sdr: raw replay messages @%.0fMHz" % (rate / 1e6))
+    check(rec.decoder.n_good == 2, "adsb_sdr: raw replay crc_ok @%.0fMHz" % (rate / 1e6))
+    rec.stop()
+    os.remove(path)
+
+replay_check_sdr(2e6, 1)
+
 print("ALL TESTS PASSED")

@@ -37,17 +37,16 @@ def crc_ok(msg, nbits):
 
 def crc_fix(msg, nbits):
     nb = nbits // 8
-    if crc24_rem(msg.to_bytes(nb, "big")) == 0:
+    mbytes = msg.to_bytes(nb, "big")
+    if crc24_rem(mbytes) == 0:
         return msg, 0
-    for i in range(nbits):
-        m = msg ^ (1 << i)
-        if crc24_rem(m.to_bytes(nb, "big")) == 0:
-            return m, 1
-    for i in range(max(0, nbits - 26), nbits):
-        for j in range(i + 1, nbits):
-            m = msg ^ (1 << i) ^ (1 << j)
+    df = (msg >> (nbits - 5)) & 0x1F
+    # Only attempt 1-bit error correction for standard DF17/DF18 ADS-B frames
+    if df in (17, 18):
+        for i in range(nbits):
+            m = msg ^ (1 << i)
             if crc24_rem(m.to_bytes(nb, "big")) == 0:
-                return m, 2
+                return m, 1
     return None
 
 
@@ -256,38 +255,60 @@ def surface_position(e0, o0, lat_ref, lon_ref, even_newer):
 
 
 # ------------------------------------------------ preamble detect + bit extract
-def detect_frames(slots):
+def detect_frames(slots, threshold_ratio=2.0):
     frames = []
     M = len(slots)
     if M < SLOTS_PER_FRAME:
         return frames
-    cs = np.empty(M + 1, dtype=np.float64)
-    cs[0] = 0
-    np.cumsum(slots, out=cs[1:])
-    total16 = cs[16:] - cs[:-16]
-    p_range = np.arange(0, M - 15, dtype=np.int64)
-    Eh = slots[p_range] + slots[p_range + 2] + slots[p_range + 7] + slots[p_range + 9]
-    El = total16[p_range] - Eh
-    thr = np.percentile(slots, 30) * 3.0
-    pmin = np.minimum.reduce(
-        [slots[p_range], slots[p_range + 2], slots[p_range + 7], slots[p_range + 9]]
-    )
-    cand = (Eh > 4 * thr) & (pmin > thr) & (Eh >= 3.0 * El)
+
+    sub = slots[::8] if M > 4000 else slots
+    f_noise = float(np.percentile(sub, 30))
+    thr = f_noise * threshold_ratio
+
+    p_cands = np.nonzero(slots[:-16] > thr)[0]
+    if len(p_cands) == 0:
+        return frames
+
     last = -1
-    for i in np.nonzero(cand)[0]:
-        p = int(p_range[i])
+    for p in p_cands:
+        p = int(p)
         if p < last:
             continue
         if p + SLOTS_PER_FRAME > M:
             break
-        frame = extract_bits(slots, p)
-        dfh = df_of(frame, 112)
-        if dfh in (0, 4, 5, 11, 20, 21):
-            frame = frame >> (112 - 56)
-            frames.append((frame, 56, p))
-        else:
-            frames.append((frame, 112, p))
-        last = p + SLOTS_PER_FRAME
+
+        s0, s1, s2, s3 = slots[p], slots[p + 1], slots[p + 2], slots[p + 3]
+        s6, s7, s8, s9, s10 = (
+            slots[p + 6],
+            slots[p + 7],
+            slots[p + 8],
+            slots[p + 9],
+            slots[p + 10],
+        )
+
+        if s0 > s1 and s2 > s1 and s2 > s3 and s7 > s6 and s7 > s8 and s9 > s8 and s9 > s10:
+            Eh = s0 + s2 + s7 + s9
+            E_low = (
+                s1
+                + s3
+                + slots[p + 4]
+                + slots[p + 5]
+                + s6
+                + s8
+                + s10
+                + slots[p + 11]
+                + slots[p + 12]
+                + slots[p + 13]
+                + slots[p + 14]
+                + slots[p + 15]
+            )
+            if Eh >= 0.70 * E_low:
+                frame = extract_bits(slots, p)
+                dfh = df_of(frame, 112)
+                nbits = 56 if dfh in (0, 4, 5, 11, 20, 21) else 112
+                f = (frame >> (112 - 56)) if nbits == 56 else frame
+                frames.append((f, nbits, p))
+                last = p + SLOTS_PER_FRAME
     return frames
 
 
@@ -300,9 +321,10 @@ def extract_bits(slots, p):
 
 # --------------------------------------------------------------- decoder core
 class Decoder:
-    def __init__(self, lat_ref=None, lon_ref=None):
+    def __init__(self, lat_ref=None, lon_ref=None, threshold_ratio=1.75):
         self.lat_ref = lat_ref
         self.lon_ref = lon_ref
+        self.threshold_ratio = threshold_ratio
         self.pos = {}
         self.recent = deque(maxlen=30)
         self.n_total = 0
@@ -310,9 +332,22 @@ class Decoder:
 
     def process(self, slots):
         out = []
-        for msg, nbits, p in detect_frames(slots):
+        for msg, nbits, p in detect_frames(slots, threshold_ratio=self.threshold_ratio):
             self.n_total += 1
             fixed = crc_fix(msg, nbits)
+            if not fixed:
+                # Try adjacent sample phase shifts (p+1, p-1) to recover sub-sample timing jitter
+                for shift in (1, -1):
+                    ps = p + shift
+                    if 0 <= ps and ps + SLOTS_PER_FRAME <= len(slots):
+                        m = extract_bits(slots, ps)
+                        dfh = df_of(m, 112)
+                        nb = 56 if dfh in (0, 4, 5, 11, 20, 21) else 112
+                        m = (m >> (112 - 56)) if nb == 56 else m
+                        fixed = crc_fix(m, nb)
+                        if fixed:
+                            msg, nbits = m, nb
+                            break
             if not fixed:
                 continue
             msg, errs = fixed
@@ -421,21 +456,83 @@ class Decoder:
 class Receiver:
     def __init__(self, args):
         self.args = args
-        if args.from_raw:
+        self.driver_name = "raw"
+        self.device_info = {}
+        if getattr(args, "from_raw", None):
             self.sdr = None
         else:
-            devs = SoapySDR.Device.enumerate("driver=hackrf")
-            if not devs:
-                raise RuntimeError("ERROR: No HackRF device found")
-            self.sdr = SoapySDR.Device(devs[0])
-        self.decoder = Decoder(lat_ref=args.lat, lon_ref=args.lon)
+            self.sdr, self.driver_name, self.device_info = self._find_device(args)
+        self.decoder = Decoder(
+            lat_ref=getattr(args, "lat", None),
+            lon_ref=getattr(args, "lon", None),
+            threshold_ratio=getattr(args, "threshold", 2.0),
+        )
         self._chunks = 0
         self.t0 = time.monotonic()
         self._tail = np.zeros(0, dtype=np.float32)
         self._rawsrc = None
         self._rawfile = None
         self._stats_t = None
-        self.sps = self._sps(args.rate)
+        self.sps = self._sps(getattr(args, "rate", SAMPLE_RATE))
+
+    @staticmethod
+    def _find_device(args):
+        dev_req = (getattr(args, "device", None) or "hackrf").lower()
+        dev_args = getattr(args, "device_args", "") or ""
+
+        def search_driver(driver_key):
+            query = f"driver={driver_key}"
+            if dev_args:
+                query = f"{query},{dev_args}"
+            results = SoapySDR.Device.enumerate(query)
+            if results:
+                return results[0], driver_key
+            return None, None
+
+        selected = None
+        driver_found = None
+
+        if dev_req == "hackrf":
+            dev, drv = search_driver("hackrf")
+            if dev is None:
+                raise RuntimeError(
+                    "ERROR: No HackRF device found. Ensure HackRF is connected and USB driver is installed."
+                )
+            selected, driver_found = dev, drv
+        elif dev_req in ("rtlsdr", "rtl"):
+            dev, drv = search_driver("rtlsdr")
+            if dev is None:
+                raise RuntimeError(
+                    "ERROR: No RTL-SDR device found. Ensure RTL-SDR dongle is connected and driver is installed."
+                )
+            selected, driver_found = dev, drv
+        elif dev_req == "auto":
+            # Check HackRF first (default preference), then RTL-SDR, then generic
+            for drv_name in ("hackrf", "rtlsdr"):
+                dev, drv = search_driver(drv_name)
+                if dev is not None:
+                    selected, driver_found = dev, drv
+                    break
+            if selected is None:
+                all_devs = SoapySDR.Device.enumerate(dev_args)
+                if all_devs:
+                    selected = all_devs[0]
+                    driver_found = dict(selected).get("driver", "generic")
+                else:
+                    raise RuntimeError("ERROR: No SDR device found (probed HackRF, RTL-SDR, generic).")
+        else:
+            query = f"driver={dev_req}" if "=" not in dev_req else dev_req
+            if dev_args:
+                query = f"{query},{dev_args}"
+            results = SoapySDR.Device.enumerate(query)
+            if not results:
+                raise RuntimeError(f"ERROR: No device found matching '{query}'")
+            selected = results[0]
+            driver_found = dev_req
+
+        info_dict = dict(selected)
+        sdr = SoapySDR.Device(selected)
+        return sdr, driver_found, info_dict
 
     @staticmethod
     def _sps(rate):
@@ -452,15 +549,94 @@ class Receiver:
             else:
                 self._rawsrc.seek(0)
             return
+
+        # Configure Frequency & Sample Rate
         self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.args.freq * 1e6)
         self.sdr.setSampleRate(SOAPY_SDR_RX, 0, float(self.args.rate))
-        for el, val in (("LNA", self.args.lna), ("AMP", self.args.amp), ("VGA", self.args.vga)):
-            if val is not None:
-                self.sdr.setGain(SOAPY_SDR_RX, 0, el, val)
-        self.stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, [0])
+
+        # Configure Frequency Correction (PPM)
+        if getattr(self.args, "ppm", None):
+            try:
+                self.sdr.setFrequencyCorrection(SOAPY_SDR_RX, 0, float(self.args.ppm))
+            except Exception as e:
+                print(f"[warning] Frequency correction (PPM) not supported: {e}", file=sys.stderr)
+
+        # Configure Bias-Tee if requested
+        if getattr(self.args, "biastee", False):
+            try:
+                self.sdr.writeSetting("biastee", "true")
+            except Exception as e:
+                print(f"[warning] Bias-Tee could not be enabled: {e}", file=sys.stderr)
+
+        is_hackrf = "hackrf" in self.driver_name.lower() or "hackrf" in str(self.device_info).lower()
+        is_rtlsdr = "rtl" in self.driver_name.lower() or "rtl" in str(self.device_info).lower()
+
+        if is_hackrf:
+            for el, val in (("LNA", getattr(self.args, "lna", None)),
+                            ("AMP", getattr(self.args, "amp", None)),
+                            ("VGA", getattr(self.args, "vga", None))):
+                if val is not None:
+                    try:
+                        self.sdr.setGain(SOAPY_SDR_RX, 0, el, float(val))
+                    except Exception as e:
+                        print(f"[warning] Failed to set HackRF gain {el}={val}: {e}", file=sys.stderr)
+        elif is_rtlsdr:
+            # Configure RTL-SDR Hardware Offset Tuning
+            if getattr(self.args, "offset_tune", True):
+                try:
+                    self.sdr.writeSetting("offset_tune", "true")
+                except Exception:
+                    pass
+
+            # Configure AGC or Manual Gain
+            if getattr(self.args, "agc", False):
+                try:
+                    self.sdr.setGainMode(SOAPY_SDR_RX, 0, True)
+                except Exception as e:
+                    print(f"[warning] Failed to enable Tuner AGC: {e}", file=sys.stderr)
+                try:
+                    self.sdr.writeSetting("digital_agc", "true")
+                except Exception as e:
+                    print(f"[warning] Failed to enable Digital AGC: {e}", file=sys.stderr)
+            else:
+                try:
+                    self.sdr.setGainMode(SOAPY_SDR_RX, 0, False)
+                except Exception:
+                    pass
+                try:
+                    self.sdr.writeSetting("digital_agc", "false")
+                except Exception:
+                    pass
+                if getattr(self.args, "gain", None) is not None:
+                    try:
+                        self.sdr.setGain(SOAPY_SDR_RX, 0, float(self.args.gain))
+                    except Exception as e:
+                        print(f"[warning] Failed to set RTL-SDR gain={self.args.gain}: {e}", file=sys.stderr)
+        else:
+            # Generic SDR gain handling
+            if getattr(self.args, "agc", False):
+                try:
+                    self.sdr.setGainMode(SOAPY_SDR_RX, 0, True)
+                except Exception:
+                    pass
+            elif getattr(self.args, "gain", None) is not None:
+                try:
+                    self.sdr.setGain(SOAPY_SDR_RX, 0, float(self.args.gain))
+                except Exception:
+                    pass
+
+        stream_args = {}
+        if is_rtlsdr:
+            stream_args = {
+                "bufflen": "65536",
+                "buffers": "64",
+                "asyncBuffs": "64",
+            }
+
+        self.stream = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, [0], stream_args)
         self.sdr.activateStream(self.stream)
-        self.read_chunk(2 ** 18)
-        if self.args.save_raw:
+        self.read_chunk(131072)
+        if getattr(self.args, "save_raw", None):
             os.makedirs(self.args.save_raw, exist_ok=True)
             fn = os.path.join(self.args.save_raw, time.strftime("iq_%Y%m%d_%H%M%S.c16"))
             self._rawfile = open(fn, "wb")
@@ -474,47 +650,61 @@ class Receiver:
         if self._rawsrc:
             self._rawsrc.close()
         if self.sdr is not None:
-            self.sdr.deactivateStream(self.stream)
-            self.sdr.closeStream(self.stream)
+            try:
+                self.sdr.deactivateStream(self.stream)
+            except Exception:
+                pass
+            try:
+                self.sdr.closeStream(self.stream)
+            except Exception:
+                pass
 
     def read_chunk(self, n):
-        buf = [np.zeros(n * 2, dtype="int16")]
+        out = np.empty(n * 2, dtype=np.int16)
         got = 0
         while got < n:
-            res = self.sdr.readStream(self.stream, buf, n - got, timeoutUs=3000000)
+            sub = [out[got * 2 :]]
+            res = self.sdr.readStream(self.stream, sub, n - got, timeoutUs=3000000)
             if res.ret < 0:
+                if res.ret in (-4, -1):  # SOAPY_SDR_OVERFLOW or TIMEOUT, continue
+                    continue
                 raise RuntimeError("readStream error %d" % res.ret)
             if res.ret == 0:
                 continue
             got += int(res.ret)
-        return buf[0]
+        return out
 
     def feed(self, samples):
-        blk = 4096
-        sps = self.sps
         n = samples.size
         if n < 2:
             return []
-        nblocks = n // (2 * blk)
-        used = nblocks * 2 * blk
-        if nblocks:
-            c = samples[:used].astype(np.float32).reshape(nblocks, blk, 2)
-            c -= c.mean(axis=1, keepdims=True)
-            mag = np.sqrt(c[..., 0] ** 2 + c[..., 1] ** 2).ravel()
-            slots = mag.reshape(nblocks * blk // sps, sps).sum(axis=1)
+
+        I = samples[0::2].astype(np.float32)
+        Q = samples[1::2].astype(np.float32)
+
+        # Software DC Blocker: remove DC baseline offset from I and Q
+        if getattr(self.args, "dc_block", True):
+            I -= I.mean()
+            Q -= Q.mean()
+
+        mag = np.sqrt(I * I + Q * Q)
+
+        rate = float(getattr(self.args, "rate", SAMPLE_RATE))
+        if abs(rate - 2_000_000.0) < 1.0:
+            slots = mag
+        elif self.sps > 1 and (rate % 2_000_000 == 0):
+            sps = self.sps
+            n_slots = mag.size // sps
+            slots = mag[: n_slots * sps].reshape(n_slots, sps).sum(axis=1)
         else:
-            slots = np.zeros(0, dtype=np.float32)
-        rem = samples[used:]
-        if rem.size:
-            cr = rem.astype(np.float32).reshape(-1, 2)
-            cr -= cr.mean(axis=0)
-            rm = np.sqrt(cr[:, 0] ** 2 + cr[:, 1] ** 2)
-            rk = rm.size // sps
-            if rk:
-                rm = rm[:rk * sps].reshape(rk, sps).sum(axis=1)
-            slots = np.concatenate([slots, rm])
+            # High-precision linear interpolation to 2.0 MSPS (e.g. 2.4 MSPS -> 2.0 MSPS)
+            n_out = int(round(len(mag) * (2_000_000.0 / rate)))
+            x = np.linspace(0, len(mag) - 1, n_out, dtype=np.float32)
+            slots = np.interp(x, np.arange(len(mag), dtype=np.float32), mag)
+
         if self._tail.size:
             slots = np.concatenate([self._tail, slots])
+
         self._last_slots = slots
         out = []
         for (fields, rawhex), errs in self.decoder.process(slots):
@@ -528,14 +718,14 @@ class Receiver:
         sys.stdout.flush()
 
     def _stats(self):
-        if not self.args.stats:
+        if not getattr(self.args, "stats", False):
             return
         now = time.monotonic()
         if self._stats_t is not None and now - self._stats_t < 5.0:
             return
         self._stats_t = now
         med = float(np.median(self._last_slots))
-        act = float((self._last_slots > 6 * med).mean())
+        act = float((self._last_slots > 2.5 * med).mean()) if med > 0 else 0.0
         print(
             "[stats %.0fs] raw=%d crc_ok=%d pulse_duty=%4.2f%% floor=%.0f"
             % (now - self.t0, self.decoder.n_total, self.decoder.n_good,
@@ -544,51 +734,123 @@ class Receiver:
         )
 
     def run(self):
-        while True:
-            if self.sdr is None:
+        if self.sdr is None:
+            while True:
                 raw = np.fromfile(self._rawsrc, dtype="<i2", count=2 ** 19)
                 if raw.size == 0:
                     break
-            else:
-                raw = self.read_chunk(2 ** 18)
-                if self.args.save_raw:
+                for out in self.feed(raw):
+                    self.emit(*out)
+                self._stats()
+            return
+
+        import queue
+        import threading
+
+        q = queue.Queue(maxsize=32)
+        stop_evt = threading.Event()
+
+        def reader():
+            while not stop_evt.is_set():
+                try:
+                    chunk = self.read_chunk(131072)
+                    q.put(chunk, timeout=0.5)
+                except Exception:
+                    if stop_evt.is_set():
+                        break
+
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+
+        try:
+            while True:
+                try:
+                    raw = q.get(timeout=0.5)
+                except queue.Empty:
+                    if stop_evt.is_set():
+                        break
+                    continue
+
+                if getattr(self.args, "save_raw", None):
                     self._rawfile.write(raw.tobytes())
-            for out in self.feed(raw):
-                self.emit(*out)
-            self._stats()
-            if self.sdr is not None and self.args.seconds \
-                    and time.monotonic() - self.t_start >= self.args.seconds:
-                break
+
+                for out in self.feed(raw):
+                    self.emit(*out)
+                self._stats()
+
+                if getattr(self.args, "seconds", None) and time.monotonic() - self.t_start >= self.args.seconds:
+                    break
+        finally:
+            stop_evt.set()
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="ADS-B (1090 MHz Mode-S) receiver for HackRF via SoapySDR"
+        description="ADS-B (1090 MHz Mode-S) receiver for HackRF & RTL-SDR via SoapySDR"
     )
-    ap.add_argument("--freq", type=float, default=1090, help="RX frequency in MHz")
-    ap.add_argument("--rate", type=float, default=SAMPLE_RATE,
-                    help="sample rate (Hz, default 2 MHz)")
-    ap.add_argument("--lna", type=float, default=40, help="LNA gain dB (0-40)")
-    ap.add_argument("--vga", type=float, default=40, help="VGA gain dB (0-62)")
-    ap.add_argument("--amp", type=float, default=0, help="AMP (RF) gain dB (0-14)")
-    ap.add_argument("--lat", type=float, default=None, help="receiver latitude (surface CPR)")
-    ap.add_argument("--lon", type=float, default=None, help="receiver longitude (surface CPR)")
+    ap.add_argument(
+        "--device", "-d",
+        default="hackrf",
+        choices=["hackrf", "rtlsdr", "auto"],
+        help="SDR hardware device (hackrf, rtlsdr, or auto; default: hackrf)",
+    )
+    ap.add_argument("--device-args", default="", help="additional SoapySDR device query arguments")
+    ap.add_argument("--freq", type=float, default=1090, help="RX frequency in MHz (default: 1090)")
+    ap.add_argument("--rate", type=float, default=None,
+                    help="sample rate in Hz (default: 2.4 MHz for RTL-SDR, 2.0 MHz for HackRF)")
+
+    # HackRF Gain settings
+    ap.add_argument("--lna", type=float, default=40, help="HackRF LNA gain dB (0-40, default: 40)")
+    ap.add_argument("--vga", type=float, default=40, help="HackRF VGA gain dB (0-62, default: 40)")
+    ap.add_argument("--amp", type=float, default=0, help="HackRF AMP (RF preamp) gain dB (0-14, default: 0)")
+
+    # RTL-SDR Gain, AGC & Tuner settings
+    ap.add_argument("--gain", "-g", type=float, default=40, help="RTL-SDR / general tuner gain in dB (default: 40)")
+    ap.add_argument("--agc", action="store_true", help="enable RTL-SDR Dual AGC (Tuner AGC + RTL2832 Digital AGC)")
+    ap.add_argument("--ppm", type=float, default=0, help="frequency correction in PPM (for RTL-SDR crystal offset)")
+    ap.add_argument("--biastee", action="store_true", help="enable Bias-Tee (power active antenna/LNA)")
+    ap.add_argument("--no-offset-tune", action="store_false", dest="offset_tune", default=True,
+                    help="disable RTL-SDR hardware offset tuning mode")
+    ap.add_argument("--no-dc-block", action="store_false", dest="dc_block", default=True,
+                    help="disable software DC block filter")
+
+    # Decode and Output options
+    ap.add_argument("--threshold", "-t", type=float, default=2.0,
+                    help="preamble detection threshold ratio relative to noise floor (default: 2.0 = ~8 dB)")
+    ap.add_argument("--lat", type=float, default=None, help="receiver latitude (for surface CPR)")
+    ap.add_argument("--lon", type=float, default=None, help="receiver longitude (for surface CPR)")
     ap.add_argument("--seconds", type=float, default=None, help="exit after N seconds")
     ap.add_argument("--stats", action="store_true", help="print periodic signal stats to stderr")
     ap.add_argument("--save-raw", default=None, metavar="DIR",
                     help="record raw CS16 IQ (interleaved int16 I/Q, little-endian, --rate Hz) to DIR as iq_<ts>.c16")
     ap.add_argument("--from-raw", default=None, metavar="FILE",
-                    help="decode a saved raw IQ file (--save-raw output) instead of the live SDR")
+                    help="decode a saved raw IQ file (--save-raw output) instead of live SDR")
     args = ap.parse_args()
 
-    rec = Receiver(args)
-    rec.start()
+    if args.rate is None:
+        args.rate = 2_400_000.0 if (args.device or "").lower() in ("rtlsdr", "rtl") else 2_000_000.0
+
+    try:
+        rec = Receiver(args)
+        rec.start()
+    except RuntimeError as e:
+        print(f"{e}", file=sys.stderr)
+        sys.exit(1)
+
     if args.from_raw:
         print("Replaying raw file %s ..." % args.from_raw, file=sys.stderr)
     else:
+        drv = rec.driver_name.upper()
+        if "HACKRF" in drv:
+            gain_info = f"LNA={args.lna:.0f} VGA={args.vga:.0f} AMP={args.amp:.0f} dB"
+        elif "RTL" in drv:
+            gain_info = "Dual AGC=ON" if args.agc else f"Gain={args.gain:.1f} dB (PPM={args.ppm:+.0f})"
+        else:
+            gain_info = f"Gain={args.gain} dB"
+
+        dc_str = "DC-Block: ON" if getattr(args, "dc_block", True) else "DC-Block: OFF"
         print(
-            "Listening on %.0f MHz (fs=%.0f Hz, LNA=%.0f VGA=%.0f AMP=%.0f dB). Ctrl-C to stop."
-            % (args.freq, args.rate, args.lna, args.vga, args.amp),
+            f"Listening with [{drv}] on {args.freq:.0f} MHz (fs={args.rate:.0f} Hz, {gain_info}, {dc_str}). Ctrl-C to stop.",
             file=sys.stderr,
         )
     t_start = time.monotonic()

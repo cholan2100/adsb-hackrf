@@ -1,20 +1,25 @@
-# ADS-B Receiver (HackRF / SoapySDR)
+# ADS-B Receiver (HackRF & RTL-SDR / SoapySDR)
 
-Decode live 1090 MHz Mode-S / ADS-B frames from a HackRF One and watch a live
+Decode live 1090 MHz Mode-S / ADS-B frames from a HackRF One or RTL-SDR dongle and watch a live
 aircraft list. Written in Python (3.12), tested on Windows 11 with
 [radioconda](https://github.com/radio-toolchain/radioconda).
 
 ```
-python adsb_hackrf.py
+# Default (HackRF):
+python adsb_sdr.py
+
+# Or RTL-SDR:
+python adsb_sdr.py --device rtlsdr --gain 40
 ```
 
 ## Files
 
-| File                   | Purpose                                        |
-| ---------------------- | ---------------------------------------------- |
-| `adsb_hackrf.py`       | Live receiver + decoder (prints frames)        |
-| `aircraft_list.py`     | Live table of aircraft, fed from the replay pipe |
-| `test_adsb.py`         | Unit/validation tests                          |
+| File                   | Purpose                                                     |
+| ---------------------- | ----------------------------------------------------------- |
+| `adsb_sdr.py`          | Multi-SDR live receiver (HackRF & RTL-SDR, HackRF default)  |
+| `adsb_hackrf.py`       | Original HackRF-specific live receiver + decoder            |
+| `aircraft_list.py`     | Live table of aircraft, fed from the replay pipe            |
+| `test_adsb.py`         | Unit/validation tests                                       |
 
 ## Requirements
 
@@ -49,18 +54,38 @@ Decoded frames stream to stdout; one line per frame:
 
 `Ctrl-C` stops. Traffic can be sparse — planes pass in bursts.
 
-### Options
+### Options & Multi-SDR Usage
 
-```
-python adsb_hackrf.py --freq 1090 --rate 2000000 --lna 40 --vga 40 --amp 0
-python adsb_hackrf.py --seconds 600              # auto-stop after 10 min
-python adsb_hackrf.py --stats                    # signal stats on stderr every 5 s
-python adsb_hackrf.py --lat 10.37 --lon 77.19    # enable ground-surface CPR fixes
-python adsb_hackrf.py --save-raw captures        # record raw I/Q while live
+```bash
+# HackRF (default device)
+python adsb_sdr.py --freq 1090 --rate 2000000 --lna 40 --vga 40 --amp 0
+
+# RTL-SDR dongle with Dual AGC (Tuner AGC + RTL2832 Digital AGC) and DC Block:
+python adsb_sdr.py --device rtlsdr --agc
+
+# RTL-SDR dongle with manual max gain (e.g. 49.6 dB):
+python adsb_sdr.py --device rtlsdr --gain 49.6 --ppm 0
+
+# RTL-SDR with active antenna LNA via Bias-Tee:
+python adsb_sdr.py --device rtlsdr --agc --biastee
+
+# Auto-detect SDR (checks HackRF first, then RTL-SDR):
+python adsb_sdr.py --device auto
+
+# General options
+python adsb_sdr.py --seconds 600              # auto-stop after 10 min
+python adsb_sdr.py --stats                    # signal stats on stderr every 5 s
+python adsb_sdr.py --lat 10.37 --lon 77.19    # enable ground-surface CPR fixes
+python adsb_sdr.py --save-raw captures        # record raw I/Q while live
 ```
 
-Defaults: 1090 MHz, 2 MS/s, LNA=40 dB, VGA=40 dB, AMP=0 dB. Do **not** enable
-the HackRF preamp (`--amp 1`), it saturates the ADC.
+Defaults: 1090 MHz, 2 MS/s.
+- **HackRF**: LNA=40 dB, VGA=40 dB, AMP=0 dB. Do **not** enable the HackRF preamp (`--amp 1`), it saturates the ADC.
+- **RTL-SDR**:
+  - `--agc`: Enables both **Tuner AGC** and **RTL2832 Digital AGC** (recommended for variable signal conditions).
+  - `--gain <dB>`: Sets manual tuner gain (0 to 49.6 dB).
+  - Software DC blocker (`--no-dc-block` to disable) and hardware offset tuning (`--no-offset-tune` to disable) are active by default to prevent zero-Hz carrier leakage.
+  - `--biastee`: Powers active antenna preamplifiers via the RTL-SDR / HackRF coax.
 
 ## Aircraft list
 

@@ -5,9 +5,12 @@
       "args": [
         "-NoExit",
         "-Command",
-        "& cmd.exe /c 'D:\\Programs\\radioconda\\Scripts\\activate.bat && set' | ForEach-Object { if ($_ -match '^(.*?)=(.*)$') { Set-Item -Path \"env:$($matches[1])\" -Value $matches[2] } }"
+        ". 'D:\\Programs\\radioconda\\shell\\condabin\\conda-hook.ps1'; conda activate base"
       ]
     }
   },
-  "terminal.integrated.defaultProfile.windows": "Radioconda (PowerShell)"
+  "terminal.integrated.defaultProfile.windows": "Radioconda (PowerShell)",
+  "python.defaultInterpreterPath": "D:\\Programs\\radioconda\\python.exe",
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
 }
